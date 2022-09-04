@@ -22,10 +22,44 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from transformers import AutoFeatureExtractor
 
 
-# load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+def load_replacement(x):
+    """
+    Loads replacement image in case of an unwanted generated image.
+    """
+    try:
+        hwc = x.shape
+        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
+        y = (np.array(y) / 255.0).astype(x.dtype)
+        assert y.shape == x.shape
+        return y
+    except Exception:
+        return x
+
+
+class SafetyChecker:
+
+    def __init__(self, cache_dir=None, enabled=True):
+        self.enabled = enabled
+        if self.enabled:
+            # load safety model
+            self.safety_model_id = "CompVis/stable-diffusion-safety-checker"
+            self.safety_feature_extractor = AutoFeatureExtractor.from_pretrained(self.safety_model_id,
+                                                                                 cache_dir=cache_dir)
+            self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(self.safety_model_id,
+                                                                               cache_dir=cache_dir)
+
+    def check(self, x_image):
+        if self.enabled:
+            safety_checker_input = self.safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
+            x_checked_image, has_nsfw_concept = self.safety_checker(images=x_image,
+                                                                    clip_input=safety_checker_input.pixel_values)
+            assert x_checked_image.shape[0] == len(has_nsfw_concept)
+            for i in range(len(has_nsfw_concept)):
+                if has_nsfw_concept[i]:
+                    x_checked_image[i] = load_replacement(x_checked_image[i])
+            return x_checked_image, has_nsfw_concept
+        else:
+            return x_image, False
 
 
 def chunk(it, size):
@@ -74,27 +108,6 @@ def put_watermark(img, wm_encoder=None):
     return img
 
 
-def load_replacement(x):
-    try:
-        hwc = x.shape
-        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
-        y = (np.array(y)/255.0).astype(x.dtype)
-        assert y.shape == x.shape
-        return y
-    except Exception:
-        return x
-
-
-def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
-
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -111,6 +124,13 @@ def main():
         nargs="?",
         help="dir to write results to",
         default="outputs/txt2img-samples"
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        nargs="?",
+        help="directory where cache for models is stored",
+        default="/results/.cache"
     )
     parser.add_argument(
         "--skip_grid",
@@ -238,15 +258,15 @@ def main():
         help="Whether to force CPU usage or not",
     )
     opt = parser.parse_args()
-    
+
     disable_filter = opt.disable_filter
     use_cpu = opt.use_cpu
-    
+    cache_dir = opt.cache_dir
+
     if use_cpu:
         torch.cuda.is_available = lambda: False
-    if disable_filter:
-        global check_safety 
-        check_safety = lambda images: (images, False)
+
+    safety_checker = SafetyChecker(cache_dir=os.path.join(cache_dir, "safety_checker"), enabled=not disable_filter)
 
     if opt.laion400m:
         print("Falling back to LAION 400M model...")
@@ -258,7 +278,6 @@ def main():
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
-    
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
@@ -298,7 +317,9 @@ def main():
     if opt.fixed_code:
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
-    precision_scope = autocast if opt.precision=="autocast" else nullcontext
+    precision_scope = autocast if opt.precision == "autocast" else nullcontext
+    #data_type = torch.bfloat16 if use_cpu else torch.float32
+    #device_type = "cpu" if use_cpu else "cuda"
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
@@ -327,7 +348,7 @@ def main():
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        x_checked_image, has_nsfw_concept = safety_checker.check(x_samples_ddim)
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 

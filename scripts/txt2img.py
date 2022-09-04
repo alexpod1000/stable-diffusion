@@ -227,7 +227,26 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--disable_filter",
+        action='store_true',
+        help="whether to disable or not the filter (use at your own risk)",
+    )
+    parser.add_argument(
+        "--use_cpu",
+        action='store_true',
+        help="Whether to force CPU usage or not",
+    )
     opt = parser.parse_args()
+    
+    disable_filter = opt.disable_filter
+    use_cpu = opt.use_cpu
+    
+    if use_cpu:
+        torch.cuda.is_available = lambda: False
+    if disable_filter:
+        global check_safety 
+        check_safety = lambda images: (images, False)
 
     if opt.laion400m:
         print("Falling back to LAION 400M model...")
@@ -239,6 +258,7 @@ def main():
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
+    
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
